@@ -13,6 +13,90 @@ import folder_paths
 import torch
 import os 
 import gc
+from pathlib import Path
+
+
+def get_mlx_model_paths():
+    """
+    Scans for MLX-compatible image generation models in:
+    1. HuggingFace cache (~/.cache/huggingface/hub/)
+    2. ComfyUI diffusion_models folder
+    
+    Supports: Flux (schnell, dev, kontext), Stable Diffusion (1.5, 2.1, SDXL, SD3)
+    Returns a list of valid model paths.
+    """
+    model_paths = []
+    
+    # MLX model patterns to search for
+    mlx_patterns = [
+        "models--*mlx-FLUX*",        # argmaxinc and other Flux models
+        "models--*flux*.mlx*",        # mlx-community Flux models
+        "models--mzbac--flux*",       # mzbac Flux variants (schnell, kontext)
+        "models--mlx-community--*",   # mlx-community models
+        "models--*stable-diffusion*.mlx*",  # MLX SD models
+        "models--*sdxl*.mlx*",        # SDXL MLX models
+        "models--*sd3*.mlx*",         # SD3 MLX models
+    ]
+    
+    # Check HuggingFace cache
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    if hf_cache.exists():
+        # Search for all MLX model patterns
+        for pattern in mlx_patterns:
+            for model_dir in hf_cache.glob(pattern):
+                # Check if model has actual files (not just empty snapshots)
+                snapshots_dir = model_dir / "snapshots"
+                if snapshots_dir.exists():
+                    # Get the latest snapshot (sorted by name, typically hash-based)
+                    snapshots = sorted([d for d in snapshots_dir.iterdir() if d.is_dir()])
+                    if snapshots:
+                        latest_snapshot = snapshots[-1]
+                        # Check if it has model files (.safetensors, .bin, or .npz for MLX)
+                        if any(latest_snapshot.glob("*.safetensors")) or \
+                           any(latest_snapshot.glob("*.bin")) or \
+                           any(latest_snapshot.glob("*.npz")):
+                            model_paths.append(str(latest_snapshot))
+    
+    # Check ComfyUI diffusion_models folder
+    try:
+        diffusion_folder = folder_paths.get_folder_paths("diffusion_models")
+        for folder in diffusion_folder:
+            folder_path = Path(folder)
+            if folder_path.exists():
+                # Look for MLX model directories (broader search)
+                for model_dir in folder_path.glob("*mlx*"):
+                    if model_dir.is_dir():
+                        # Check if it has model files
+                        if any(model_dir.glob("*.safetensors")) or \
+                           any(model_dir.glob("*.bin")) or \
+                           any(model_dir.glob("*.npz")):
+                            model_paths.append(str(model_dir))
+                # Also check for SD models
+                for pattern in ["*flux*", "*stable-diffusion*", "*sdxl*", "*sd3*"]:
+                    for model_dir in folder_path.glob(pattern):
+                        if model_dir.is_dir():
+                            if any(model_dir.glob("*.safetensors")) or \
+                               any(model_dir.glob("*.bin")) or \
+                               any(model_dir.glob("*.npz")):
+                                if str(model_dir) not in model_paths:
+                                    model_paths.append(str(model_dir))
+    except:
+        # folder_paths might not have diffusion_models registered yet
+        # Try manual check
+        comfy_models = Path(folder_paths.models_dir) / "diffusion_models"
+        if comfy_models.exists():
+            for model_dir in comfy_models.glob("*mlx*"):
+                if model_dir.is_dir():
+                    if any(model_dir.glob("*.safetensors")) or \
+                       any(model_dir.glob("*.bin")) or \
+                       any(model_dir.glob("*.npz")):
+                        model_paths.append(str(model_dir))
+    
+    # If no models found, return a helpful placeholder
+    if not model_paths:
+        model_paths = ["No local MLX models found - download Flux/SD models first"]
+    
+    return model_paths
 
 class MLXDecoder:
     """
@@ -54,6 +138,7 @@ class MLXSampler:
     """
     MLX-optimized sampler for generating images from text conditioning.
     Performs denoising diffusion with configurable steps, CFG, and seed.
+    Supports optional negative conditioning for classifier-free guidance.
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -63,6 +148,7 @@ class MLXSampler:
             "steps": ("INT", {"default": 4, "min": 1, "max": 10000}),
             "cfg": ("FLOAT", {"default": 0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01}),
             "mlx_positive_conditioning": ("mlx_conditioning", ),
+            "mlx_negative_conditioning": ("mlx_conditioning", ),
             "latent_image": ("LATENT", ),
             "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 }
@@ -71,12 +157,23 @@ class MLXSampler:
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "generate_image"
 
-    def generate_image(self, mlx_model, seed, steps, cfg, mlx_positive_conditioning, latent_image, denoise):
+    def generate_image(self, mlx_model, seed, steps, cfg, mlx_positive_conditioning, latent_image, denoise, mlx_negative_conditioning=None):
         # Ensure seed is within valid range for MLX (32-bit)
         seed = seed & 0xffffffff 
         
         conditioning = mlx_positive_conditioning["conditioning"]
         pooled_conditioning = mlx_positive_conditioning["pooled_conditioning"]
+        
+        # Handle negative conditioning when CFG is enabled
+        if mlx_negative_conditioning is not None and cfg > 0:
+            negative_cond = mlx_negative_conditioning["conditioning"]
+            negative_pooled = mlx_negative_conditioning["pooled_conditioning"]
+            
+            # Concatenate positive and negative conditioning
+            # Format: [positive, negative] for CFG
+            conditioning = mx.concatenate([conditioning, negative_cond], axis=0)
+            pooled_conditioning = mx.concatenate([pooled_conditioning, negative_pooled], axis=0)
+        
         num_steps = steps 
         cfg_weight = cfg
             
@@ -180,24 +277,54 @@ class MLXLoadFlux:
 
 class MLXLoadFluxLocal:
     """
-    Loads Flux models from a local checkpoint file.
-    Useful for loading custom or locally stored models.
+    Loads MLX image generation models from local checkpoint files.
+    Automatically detects Flux (schnell, dev, kontext), Stable Diffusion (1.5, 2.1, SDXL, SD3),
+    and other MLX models from HuggingFace cache and ComfyUI folders.
     """
     @classmethod
     def INPUT_TYPES(s):
+        # Get available local models
+        available_models = get_mlx_model_paths()
+        
+        # Add option for custom path
+        available_models.append("Custom path (enter below)")
+        
         return {"required": {
             "model_version": ([
                         "argmaxinc/mlx-FLUX.1-schnell-4bit-quantized",
                         "argmaxinc/mlx-FLUX.1-schnell",  
                         "argmaxinc/mlx-FLUX.1-dev"
                         ],),
-            "local_path": ("STRING", {"default": "", "multiline": False})
+            "local_path": (available_models,)
+        },
+        "optional": {
+            "custom_path": ("STRING", {"default": "", "multiline": False})
         }}
     
     RETURN_TYPES = ("mlx_model", "mlx_vae", "mlx_conditioning")
     FUNCTION = "load_flux_model"
 
-    def load_flux_model(self, model_version, local_path):
+    def load_flux_model(self, model_version, local_path, custom_path=""):
+        
+        # Use custom path if specified
+        if local_path == "Custom path (enter below)":
+            if not custom_path or custom_path.strip() == "":
+                raise ValueError("Please enter a custom path in the 'custom_path' field")
+            local_path = custom_path.strip()
+        
+        # Check if it's the placeholder message
+        if "No local" in local_path and "models found" in local_path:
+            raise ValueError(
+                "No MLX models found locally. Supported models:\n"
+                "• Flux: schnell, dev, kontext (4-bit recommended, ~9GB)\n"
+                "• Stable Diffusion: 1.5, 2.1, SDXL, SD3\n"
+                "• Any MLX-community models from HuggingFace\n\n"
+                "To add models:\n"
+                "1. Download using MLXLoadFlux node (auto-cached), or\n"
+                "2. Place model files in ComfyUI/models/diffusion_models/, or\n"
+                "3. Models download to ~/.cache/huggingface/hub/\n"
+                "4. Select 'Custom path (enter below)' to enter path manually"
+            )
         
         if not os.path.exists(local_path):
             raise ValueError(f"Local model path does not exist: {local_path}")
@@ -244,7 +371,9 @@ class MLXLoadFluxLocal:
 class MLXClipTextEncoder: 
     """
     Encodes text prompts using CLIP and T5 encoders for MLX-based Flux models.
-    Supports both positive and optional negative prompts for better control.
+    Creates conditioning embeddings for image generation.
+    For negative prompts with CFG: use two text encoder nodes (positive and negative)
+    and connect them to the MLXSampler's positive and negative conditioning inputs.
     """
 
     @classmethod
@@ -253,9 +382,6 @@ class MLXClipTextEncoder:
             "required": {
                 "text": ("STRING", {"multiline": True, "dynamicPrompts": True}), 
                 "mlx_conditioning": ("mlx_conditioning", {"forceInput":True})
-            },
-            "optional": {
-                "negative_text": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": ""})
             }
         }
 
@@ -287,7 +413,7 @@ class MLXClipTextEncoder:
 
         return tokens
 
-    def encode(self, mlx_conditioning, text, negative_text=""):
+    def encode(self, mlx_conditioning, text):
 
         T5_MAX_LENGTH = {
             "argmaxinc/mlx-stable-diffusion-3-medium": 512,
