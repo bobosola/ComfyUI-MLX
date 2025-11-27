@@ -177,18 +177,17 @@ class MLXSampler:
         num_steps = steps 
         cfg_weight = cfg
             
+        # NB: height & width values from a .shape have already undergone //8 to force
+        # latent compression. So the values must be multiplied by 8 to return the
+        # user-entered pixel values for error messages.
         batch, channels, height, width = latent_image["samples"].shape
-        
-        # Ensure latent dimensions are integers (ComfyUI sometimes passes floats)
-        height = int(height)
-        width = int(width)
-        
-        # Validate dimensions for Flux models
-        # Flux requires dimensions divisible by 16 (patch size * vae scale)
-        if height % 16 != 0 or width % 16 != 0:
+
+        # Flux requires multiples of 16 (patch size * vae scale)
+        # so raise an error for pixel values not divisible by 16
+        if height * 8 % 16 != 0 or width * 8 % 16 != 0:
             raise ValueError(
-                f"Latent dimensions must be divisible by 16. Got {height}x{width}. "
-                f"For a {height*8}x{width*8} pixel image, use a {(height//16)*16}x{(width//16)*16} latent."
+                f"Flux dimensions must be divisible by 16. Got {width*8}x{height*8}. "
+                f"Suggest using {(width*8//16)*16}x{(height*8//16)*16}."
             )
         
         latent_size = (height, width)
